@@ -32,6 +32,7 @@ import json
 import os
 import pathlib
 import platform
+import posixpath
 import re
 import sys
 import urllib.parse
@@ -422,7 +423,61 @@ def quote_url(url):
     return quoted_url
 
 
-class _ArtifactoryFlavour(pathlib._Flavour):
+class CompatFlavour:
+    def normcase(self, path):
+        import posixpath
+
+        return posixpath.normcase(path)
+
+    def join(self, a, *p):
+        import posixpath
+
+        return posixpath.join(a, *p)
+
+    def splitdrive(self, p):
+        import posixpath
+
+        return posixpath.splitdrive(p)
+
+    def parse_parts(self, parts):
+        if not parts:
+            return "", "", []
+        sep = self.sep
+        altsep = self.altsep
+        path = self.pathmod.join(*parts)
+        if altsep:
+            path = path.replace(altsep, sep)
+        drv, root, rel = self.splitroot(path)
+        unfiltered_parsed = [drv + root] + rel.split(sep)
+        parsed = [sys.intern(x) for x in unfiltered_parsed if x and x != "."]
+        return drv, root, parsed
+
+    def join_parsed_parts(self, drv, root, parts, drv2, root2, parts2):
+        """
+        Join the two paths represented by the respective
+        (drive, root, parts) tuples.  Return a new (drive, root, parts) tuple.
+        """
+        if root2:
+            if not drv2 and drv:
+                return drv, root2, [drv + root2] + parts2[1:]
+        elif drv2:
+            if drv2 == drv or self.casefold(drv2) == self.casefold(drv):
+                # Same drive => second path is relative to the first
+                return drv, root, parts + parts2[1:]
+        else:
+            # Second path is non-anchored (common case)
+            return drv, root, parts + tuple(parts2)
+        return drv2, root2, parts2
+
+
+pathlib_flavour = (
+    CompatFlavour
+    if sys.version_info.major == 3 and sys.version_info.minor >= 12
+    else pathlib._Flavour
+)
+
+
+class _ArtifactoryFlavour(pathlib_flavour):
     """
     Implements Artifactory-specific pure path manipulations.
     I.e. what is 'drive', 'root' and 'path' and how to split full path into
@@ -440,7 +495,7 @@ class _ArtifactoryFlavour(pathlib._Flavour):
     sep = "/"
     altsep = "/"
     has_drv = True
-    pathmod = pathlib.posixpath
+    pathmod = posixpath
     is_supported = True
 
     def _get_base_url(self, url):
@@ -459,7 +514,7 @@ class _ArtifactoryFlavour(pathlib._Flavour):
         )
 
         if not root2 and len(parts2) > 1:
-            root2 = self.sep + parts2.pop(1) + self.sep
+            root2 = self.sep + list(parts2).pop(1) + self.sep
 
         # quick hack for https://github.com/devopshq/artifactory/issues/29
         # drive or repository must start with / , if not - add it
@@ -877,7 +932,11 @@ class _ArtifactoryAccessor:
         )
         code = response.status_code
         text = response.text
-        if code == 404 and ("Unable to find item" in text or "Not Found" in text or "File not found" in text):
+        if code == 404 and (
+            "Unable to find item" in text
+            or "Not Found" in text
+            or "File not found" in text
+        ):
             raise OSError(2, f"No such file or directory: {url}")
 
         raise_for_status(response)
@@ -1469,7 +1528,49 @@ class ArtifactoryOpensourceAccessor(_ArtifactoryAccessor):
     """
 
 
-class PureArtifactoryPath(pathlib.PurePath):
+class PathlibCompat(pathlib.PurePath):
+    def is_relative_to(self, other):
+        other = self.with_segments(other)
+        return other == self or other in self.parents
+
+    @property
+    def parents(self):
+        parents = super(PathlibCompat, self).parents
+        P = self.__class__
+        parents = [P(p) for p in parents]
+        return parents + [P(self.drive)]
+
+    def relative_to(self, other):
+        """Return the relative path to another path identified by the passed
+        arguments.  If the operation is not possible (because this is not
+        related to the other path), raise ValueError.
+
+        The *walk_up* parameter controls whether `..` may be used to resolve
+        the path.
+        """
+
+        other = self.with_segments(other)
+        for step, path in enumerate([other] + list(other.parents)):
+            if self.is_relative_to(path):
+                break
+            else:
+                raise ValueError(
+                    f"{str(self)!r} is not in the subpath of {str(other)!r}"
+                )
+        else:
+            raise ValueError(f"{str(self)!r} and {str(other)!r} have different anchors")
+        parts = [".."] * step + [self.root] + self._tail[len(path._tail) :]
+        return self.with_segments(*parts)
+
+
+pathlib_purepath = (
+    PathlibCompat
+    if sys.version_info.major == 3 and sys.version_info.minor >= 12
+    else pathlib.PurePath
+)
+
+
+class PureArtifactoryPath(pathlib_purepath):
     """
     A class to work with Artifactory paths that doesn't connect
     to Artifactory server. I.e. it supports only basic path
@@ -1505,6 +1606,9 @@ class ArtifactoryPath(pathlib.Path, PureArtifactoryPath):
         # in 3.9 and below Pathlib limits what members can be present in 'Path' class
         __slots__ = ("auth", "verify", "cert", "session", "timeout")
 
+    def init(self, *args, **kwargs):
+        super().__init__(*args)
+
     def __new__(cls, *args, **kwargs):
         """
         pathlib.Path overrides __new__ in order to create objects
@@ -1514,6 +1618,8 @@ class ArtifactoryPath(pathlib.Path, PureArtifactoryPath):
         only then add auth information.
         """
         obj = pathlib.Path.__new__(cls, *args, **kwargs)
+        if sys.version_info.major == 3 and sys.version_info.minor >= 12:
+            obj.__init__(*args)
 
         cfg_entry = get_global_config_entry(obj.drive)
 
@@ -1609,7 +1715,7 @@ class ArtifactoryPath(pathlib.Path, PureArtifactoryPath):
 
         return resp
 
-    def stat(self, pathobj=None):
+    def stat(self, pathobj=None, follow_symlinks=True):
         """
         Request remote file/directory status info
         Returns an object of class ArtifactoryFileStat.
@@ -2843,3 +2949,7 @@ def walk(pathobj, topdown=True):
             yield result
     if not topdown:
         yield pathobj, dirs, nondirs
+
+
+if sys.version_info.major == 3 and sys.version_info.minor >= 12:
+    ArtifactoryPath.__init__ = ArtifactoryPath.init
